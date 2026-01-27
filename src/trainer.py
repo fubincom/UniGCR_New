@@ -18,14 +18,38 @@ class UniGCRTrainer:
             self.bce_loss = nn.BCEWithLogitsLoss()
             self.ce_loss = nn.CrossEntropyLoss()
 
-        # DeepSpeed Initialize
+        # --- DeepSpeed Configuration Logic (New!) ---
+        ds_config = None
+        
+        # 1. 显式读取 ds_config.json
+        if hasattr(args, 'deepspeed_config') and args.deepspeed_config:
+            with open(args.deepspeed_config, 'r') as f:
+                ds_config = json.load(f)
+            
+            # 2. (可选) 动态覆盖参数，确保 config.py 是唯一真理
+            # 比如：强制让 DeepSpeed 的 batch size 等于我们 DataLoader 的设置
+            # 注意：DeepSpeed 的 train_batch_size 指的是 Global Batch Size
+            # Global = Micro_Batch_Per_GPU * World_Size * Grad_Accumulation
+            
+            # 这里演示最简单的：如果你在 json 里写了 "auto"，我们可以不做处理，
+            # 或者在这里手动把 config.lr 塞进去
+            if 'optimizer' in ds_config and 'params' in ds_config['optimizer']:
+                if ds_config['optimizer']['params'].get('lr') == 'auto':
+                    ds_config['optimizer']['params']['lr'] = config.lr
+            
+            if is_main_process():
+                print(f"[DeepSpeed] Config loaded explicitly from {args.deepspeed_config}")
+        
+        # --- DeepSpeed Initialize ---
+        # 注意这里我们使用了 config=ds_config，而不是完全依赖 args
         self.model_engine, self.optimizer, _, _ = deepspeed.initialize(
             args=args,
             model=model,
             model_parameters=model.parameters(),
+            config=ds_config, # <--- 显式传入字典
             dist_init_required=True
         )
-
+        
     def calculate_ctr_loss(self, ctr_logits, ctr_labels):
         target_idx = torch.argmax(ctr_labels, dim=1)
         loss_info = self.ce_loss(ctr_logits / self.config.temp, target_idx)
