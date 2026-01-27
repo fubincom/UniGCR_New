@@ -163,26 +163,78 @@ class UniGCRModel(nn.Module):
         return u
 
     def predict_ctr(self, u, targets, gr_logits, device):
-        # (代码同上一版，无需修改，因为 u 已经包含了 side info 的信息)
+        """
+        构建动态 Memory Bank 并进行 CTR 预测。
+        包含严谨的 Ground Truth Injection 和 Masking 逻辑。
+        """
         B = u.size(0)
         N = self.config.memory_bank_size
         K = self.config.num_hard_negatives
-        gt_emb = self.item_emb(targets).unsqueeze(1)
-        _, top_k = torch.topk(gr_logits.detach(), K, dim=1)
-        hard_emb = self.item_emb(top_k)
+        
+        # --- 1. GT Injection (正样本注入) ---
+        # 无论 GR 是否召回，强制将 GT Embedding 拿出来
+        gt_emb = self.item_emb(targets).unsqueeze(1) # (B, 1, D)
+        
+        # --- 2. Hard Negatives 生成 (关键优化) ---
+        # 目的：从 GR Logits 选出 K 个最像的，但必须排除掉 GT 本身
+        # 方法：先将 Logits 中 GT 的位置设为负无穷，再取 Top-K
+        
+        # 克隆 logits 以免影响 GR 分支的梯度或后续计算
+        masked_logits = gr_logits.detach().clone()
+        
+        # 创建 scatter 索引：targets 需要 reshape 为 (B, 1)
+        src_indices = targets.unsqueeze(1)
+        
+        # 将 GT 对应的 logits 设为 -inf
+        masked_logits.scatter_(1, src_indices, float('-inf'))
+        
+        # 现在取 Top-K，绝对不会包含 GT
+        _, top_k_indices = torch.topk(masked_logits, K, dim=1)
+        hard_emb = self.item_emb(top_k_indices) # (B, K, D)
+        
+        # --- 3. Easy Negatives (随机负样本) ---
         num_easy = N - 1 - K
-        rand_ids = torch.randint(1, self.config.num_items, (B, num_easy)).to(device)
+        rand_ids = torch.randint(1, self.config.num_items + 1, (B, num_easy)).to(device)
         easy_emb = self.item_emb(rand_ids)
-        bank = torch.cat([gt_emb, hard_emb, easy_emb], dim=1)
-        labels = torch.zeros((B, N), device=device); labels[:, 0] = 1.0
-        idx = torch.randperm(N).to(device)
-        bank = bank[:, idx, :]; labels = labels[:, idx]
+        
+        # --- 4. 构建 Memory Bank ---
+        # M = {h_gt, h_hard_1...k, h_easy_1...m}
+        bank = torch.cat([gt_emb, hard_emb, easy_emb], dim=1) # (B, N, D)
+        
+        # --- 5. 构建 Labels ---
+        # 初始状态：第 0 个位置是 GT (Label = 1.0)
+        labels = torch.zeros((B, N), device=device)
+        labels[:, 0] = 1.0
+        
+        # --- 6. 随机打乱 (Shuffling) ---
+        # 非常重要：防止模型根据位置作弊 (例如学会“第0个总是对的”)
+        rand_perm = torch.randperm(N).to(device)
+        bank = bank[:, rand_perm, :]
+        labels = labels[:, rand_perm]
+        
+        # --- 7. Candidate-Aware Attention & Scoring ---
+        # 对 Bank 中的向量做一次 Projection (Norm + MLP)
         bank_proj = self.cand_proj(bank)
-        u_q = u.unsqueeze(1)
-        ctx, _ = self.cross_attn(u_q, bank_proj, bank_proj)
-        u_exp = u.unsqueeze(1).repeat(1, N, 1); ctx_exp = ctx.repeat(1, N, 1)
-        feat = torch.cat([bank_proj, u_exp, ctx_exp], dim=-1)
-        return self.scorer(feat).squeeze(-1), labels
+        
+        # User-Centric Cross Attention
+        # Q = User State (u)
+        # K, V = Memory Bank
+        u_q = u.unsqueeze(1) # (B, 1, D)
+        
+        # attn_out 代表 user 在当前候选集下的 Context
+        ctx, _ = self.cross_attn(u_q, bank_proj, bank_proj) # (B, 1, D)
+        
+        # 拼接特征: [Candidate, User, Context]
+        # 广播 User 和 Context 以匹配 Bank 大小
+        u_exp = u.unsqueeze(1).repeat(1, N, 1)
+        ctx_exp = ctx.repeat(1, N, 1)
+        
+        feat = torch.cat([bank_proj, u_exp, ctx_exp], dim=-1) # (B, N, 3*D)
+        
+        # 打分
+        ctr_logits = self.scorer(feat).squeeze(-1) # (B, N)
+        
+        return ctr_logits, labels
     
     def forward(self, history, cat_feats, num_feats):
         u = self.get_user_state(history, cat_feats, num_feats)
