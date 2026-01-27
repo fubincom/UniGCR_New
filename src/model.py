@@ -183,10 +183,8 @@ class UniGCRModel(nn.Module):
         masked_logits = gr_logits.detach().clone()
         
         # 创建 scatter 索引：targets 需要 reshape 为 (B, 1)
-        src_indices = targets.unsqueeze(1)
-        
         # 将 GT 对应的 logits 设为 -inf
-        masked_logits.scatter_(1, src_indices, float('-inf'))
+        masked_logits.scatter_(1, targets.unsqueeze(1), float('-inf'))
         
         # 现在取 Top-K，绝对不会包含 GT
         _, top_k_indices = torch.topk(masked_logits, K, dim=1)
@@ -211,28 +209,37 @@ class UniGCRModel(nn.Module):
         rand_perm = torch.randperm(N).to(device)
         bank = bank[:, rand_perm, :]
         labels = labels[:, rand_perm]
+
+        # --- 7. CTR Scoring 基础特征收集 ---
+        # Candidate 自身特征
+        bank_proj = self.cand_proj(bank) # (B, N, D)
+        # User 特征 (Broadcast)
+        u_exp = u.unsqueeze(1).repeat(1, N, 1) # (B, N, D)
+        # 收集所有特征
+        feature_list = [bank_proj, u_exp]
         
-        # --- 7. Candidate-Aware Attention & Scoring ---
-        # 对 Bank 中的向量做一次 Projection (Norm + MLP)
-        bank_proj = self.cand_proj(bank)
+        # --- 8. [可选] Candidate-Aware Self-Attention ---
+        # 候选集互相看: "在这个池子里，我算好的吗？"
+        if self.config.ctr_use_self_attn:
+            # Q=K=V=Bank
+            self_out, _ = self.cand_self_attn(bank_proj, bank_proj, bank_proj) # (B, N, D)
+            feature_list.append(self_out)
         
-        # User-Centric Cross Attention
-        # Q = User State (u)
-        # K, V = Memory Bank
-        u_q = u.unsqueeze(1) # (B, 1, D)
+        # ---9. [可选] User-Centric Cross-Attention ---
+        # 用户看候选集: "在这个池子里，我更关注谁？"
+        # 注意: Q=User, K=V=Bank. 输出的是 User 在当前 Context 下的聚合向量
+        if self.config.ctr_use_cross_attn:
+            u_q = u.unsqueeze(1) # (B, 1, D)
+            # 输出 (B, 1, D)
+            cross_out, _ = self.user_cross_attn(u_q, bank_proj, bank_proj) 
+            # 扩展到每个 Candidate 上
+            cross_exp = cross_out.repeat(1, N, 1) # (B, N, D)
+            feature_list.append(cross_exp)
         
-        # attn_out 代表 user 在当前候选集下的 Context
-        ctx, _ = self.cross_attn(u_q, bank_proj, bank_proj) # (B, 1, D)
-        
-        # 拼接特征: [Candidate, User, Context]
-        # 广播 User 和 Context 以匹配 Bank 大小
-        u_exp = u.unsqueeze(1).repeat(1, N, 1)
-        ctx_exp = ctx.repeat(1, N, 1)
-        
-        feat = torch.cat([bank_proj, u_exp, ctx_exp], dim=-1) # (B, N, 3*D)
-        
-        # 打分
-        ctr_logits = self.scorer(feat).squeeze(-1) # (B, N)
+        # ---10. 拼接 & 打分 ---9.
+        # (B, N, Total_Dim)
+        final_feats = torch.cat(feature_list, dim=-1)
+        ctr_logits = self.scorer(final_feats).squeeze(-1)
         
         return ctr_logits, labels
     
