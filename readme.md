@@ -1,3 +1,4 @@
+```Text
 UniGCR_Project/
 ├── data/                   # 存放原始数据
 ├── src/
@@ -8,3 +9,4 @@ UniGCR_Project/
 │   ├── trainer.py          # 封装训练和评估流程
 │   └── utils.py            # 评价指标 NDCG/Hit 等
 └── run.py                  # 启动脚本
+```Text
