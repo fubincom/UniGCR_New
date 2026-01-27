@@ -9,7 +9,6 @@ UniGCR_Project/
 │   ├── trainer.py          # 封装训练和评估流程
 │   └── utils.py            # 评价指标 NDCG/Hit 等
 └── run.py                  # 启动脚本
-Text```
 
 配置
 PyTorch 带CUDA
@@ -25,16 +24,13 @@ pip install deepspeed numpy pandas scikit-learn tqdm wget triton
 
 # 安装 Meta 的 generative-recommenders (HSTU)
 pip install git+https://github.com/facebookresearch/generative-recommenders.git@main
-```Text
 
 如何使用这套代码
-```Text
 准备数据：将下载好的 reviews_Beauty_5.json.gz 放入 data/ 目录。
 # 指定可见设备
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 run.py \
     --deepspeed \
     --deepspeed_config ds_config.json
-```Text
 
 评价指标完善：
 GR: 保持了 HitRate 和 NDCG。
