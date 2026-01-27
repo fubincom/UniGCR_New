@@ -1,3 +1,6 @@
+统一生成式检索 (Generative Retrieval, GR) 与点击率预测 (CTR) 的多任务学习框架。其核心思想是利用共享的序列表达能力，同时驱动两种不同性质的推荐任务。
+
+
 ```Text
 UniGCR_Project/
 ├── data/                   # 存放原始数据
