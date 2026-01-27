@@ -11,6 +11,22 @@ UniGCR_Project/
 └── run.py                  # 启动脚本
 ```Text
 
+PyTorch 带CUDA
+# 示例：安装 PyTorch 2.1 + CUDA 12.1
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+安装Flash Attention 2
+pip install packaging ninja
+pip install flash-attn --no-build-isolation
+
+安装其他依赖包
+# 安装 DeepSpeed, Scikit-learn 等
+pip install deepspeed numpy pandas scikit-learn tqdm wget triton
+
+# 安装 Meta 的 generative-recommenders (HSTU)
+pip install git+https://github.com/facebookresearch/generative-recommenders.git@main
+
+
+
 如何使用这套代码
 准备数据：将下载好的 reviews_Beauty_5.json.gz 放入 data/ 目录。
 运行：python run.py
