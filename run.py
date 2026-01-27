@@ -47,6 +47,15 @@ def main():
     # 开启 CTR 联合训练
     conf.enable_ctr = True 
     # -------------------------------
+
+    # CTR任务 +Self: [Candidate, User, Self_Ctx]
+    conf.ctr_use_self_attn = True 
+    # CTR任务 +All: [Candidate, User, Self_Ctx, Cross_Ctx] (4 * D)
+    conf.ctr_use_cross_attn = True
+    
+    # CTR任务 只用基础的双塔模式 Base: [Candidate, User] (2 * D)
+    # conf.ctr_use_self_attn = False
+    # conf.ctr_use_cross_attn = False
     
     set_seed(conf.seed)
     
