@@ -9,29 +9,26 @@ from src.trainer import UniGCRTrainer
 from src.utils import set_seed
 
 def main():
-    # 1. 初始化配置
+    args = parse_args()
+    setup_distributed()
+    
+    # 你可以在这里手动修改 config，或者通过 argparse 传参覆盖
     conf = UniGCRConfig()
+    conf.enable_ctr = True # 或者 False 来进行消融实验 (Ablation Study)
+    
     set_seed(conf.seed)
-    
-    # 2. 准备数据 (内部处理了 build vocab)
-    print("Preparing Data...")
     train_dl, val_dl = get_dataloaders(conf)
-    print(f"Vocab Size -> Users: {conf.num_users}, Items: {conf.num_items}")
     
-    # 3. 初始化模型
     model = UniGCRModel(conf)
     
-    # 4. 初始化 Trainer
-    trainer = UniGCRTrainer(
-        config=conf,
-        model=model,
-        train_loader=train_dl,
-        val_loader=val_dl
-    )
+    trainer = UniGCRTrainer(conf, args, model, train_dl, val_dl)
     
-    # 5. 开始训练
-    print("Start Training...")
+    if is_main_process():
+        mode_str = "Joint Training (GR + CTR)" if conf.enable_ctr else "GR Only"
+        print(f"Start Training... Mode: [{mode_str}]")
+    
     trainer.train()
 
 if __name__ == "__main__":
     main()
+
