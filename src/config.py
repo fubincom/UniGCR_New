@@ -5,6 +5,10 @@ import torch
 class UniGCRConfig:
     # --- 任务控制 ---
     enable_ctr: bool = True  # 新增：控制是否训练 CTR 任务
+
+    # --- Early Stopping 设置 ---
+    # 如果验证集指标连续 patience 个 epoch 没有提升，则停止训练
+    patience: int = 3
     
     # --- 数据路径 ---
     data_path: str = "data/reviews_Beauty_5.json.gz"
