@@ -9,9 +9,9 @@ UniGCR_Project/
 │   ├── trainer.py          # 封装训练和评估流程
 │   └── utils.py            # 评价指标 NDCG/Hit 等
 └── run.py                  # 启动脚本
+Text```
 
 配置
-```Text
 PyTorch 带CUDA
 # 示例：安装 PyTorch 2.1 + CUDA 12.1
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
