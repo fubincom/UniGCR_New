@@ -8,6 +8,24 @@ from src.model import UniGCRModel
 from src.trainer import UniGCRTrainer
 from src.utils import set_seed
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Uni-GCR DeepSpeed Training")
+    
+    # DeepSpeed 分布式必须参数
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='local rank passed from distributed launcher')
+    
+    # 显式指定 DeepSpeed 配置文件路径
+    parser.add_argument('--deepspeed_config', type=str, default='ds_config.json',
+                        help='Path to DeepSpeed config file')
+    
+    # 添加 DeepSpeed 自身的参数 (如 --deepspeed, --deepspeed_mpi 等)
+    parser = deepspeed.add_config_arguments(parser)
+    
+    args = parser.parse_args()
+    return args
+
+
 def main():
     args = parse_args()
     setup_distributed()
