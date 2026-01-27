@@ -15,6 +15,16 @@ UniGCR_Project/
 准备数据：将下载好的 reviews_Beauty_5.json.gz 放入 data/ 目录。
 运行：python run.py
 
+评价指标完善：
+GR: 保持了 HitRate 和 NDCG。
+CTR: 新增了 AUC 和 LogLoss。通过 gather_tensors 确保了在多 GPU 环境下，AUC 是基于全局数据计算的，而不是局部 AUC 的平均值（那是不准确的）。
+
+配置灵活性 (enable_ctr)：
+enable_ctr=False: 纯序列推荐模型（类似 SASRec/BERT4Rec） ； enable_ctr=True: Uni-GCR 完整模式，联合优化排序能力。
+
+
+
+
 
 代码重构的亮点总结
 高内聚低耦合：
