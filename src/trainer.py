@@ -49,33 +49,35 @@ class UniGCRTrainer:
 
         for batch in pbar:
             device = self.model_engine.device
+            
+            # --- Unpack Batch (Hybrid Input) ---
             hist = batch['history'].to(device)
-            uid = batch['user_id'].to(device)
+            cat_feats = batch['cat_feats'].to(device)
+            num_feats = batch['num_feats'].to(device)
             tgt = batch['target'].to(device)
             
             self.model_engine.zero_grad()
             
-            # 1. GR Task (Always Run)
-            u, gr_logits = self.model_engine(hist, uid)
+            # 1. GR Task: 传入所有特征
+            u, gr_logits = self.model_engine(hist, cat_feats, num_feats)
             loss_gr = self.gr_criterion(gr_logits, tgt)
             loss = loss_gr
             
-            # 2. CTR Task (Conditional)
+            # 2. CTR Task
             loss_ctr_val = 0.0
             if self.config.enable_ctr:
-                if hasattr(self.model_engine, 'module'):
-                    real_model = self.model_engine.module
-                else:
-                    real_model = self.model_engine
+                if hasattr(self.model_engine, 'module'): real_model = self.model_engine.module
+                else: real_model = self.model_engine
                 
+                # predict_ctr 内部逻辑不变
                 ctr_logits, ctr_labels = real_model.predict_ctr(u, tgt, gr_logits, device)
                 loss_ctr, _, _ = self.calculate_ctr_loss(ctr_logits, ctr_labels)
-                
                 loss += loss_ctr
                 loss_ctr_val = loss_ctr.item()
 
             self.model_engine.backward(loss)
             self.model_engine.step()
+
             
             total_loss += loss.item()
             total_gr_loss += loss_gr.item()
@@ -115,10 +117,12 @@ class UniGCRTrainer:
         
         for batch in iterator:
             hist = batch['history'].to(device)
-            uid = batch['user_id'].to(device)
+            cat_feats = batch['cat_feats'].to(device)
+            num_feats = batch['num_feats'].to(device)
             tgt = batch['target'].to(device)
             
-            u, gr_logits = self.model_engine(hist, uid)
+            # Inference 也要传入特征
+            u, gr_logits = self.model_engine(hist, cat_feats, num_feats)
             
             # --- GR Eval (Always) ---
             _, top_indices = torch.topk(gr_logits, topk, dim=1)
