@@ -1,6 +1,12 @@
 import torch
 import torch.nn as nn
 
+# 尝试导入官方实现
+try:
+    from generative_recommenders.modeling.sequential.hstu import HSTU as OfficialHSTU
+except ImportError:
+    OfficialHSTU = None
+
 class FeatureTokenizer(nn.Module):
     """
     将非序列特征（Categorical + Numerical）转换为 Transformer 可理解的 Token Embeddings。
@@ -69,30 +75,16 @@ class FeatureTokenizer(nn.Module):
         
         return out
 
-class HSTU(nn.Module):
-    def __init__(self, dim, heads, layers, dropout):
-        super().__init__()
-        # 使用 PyTorch 原生 TransformerEncoder
-        self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=dim, nhead=heads, dim_feedforward=dim*4, dropout=dropout, batch_first=True, norm_first=True)
-            for _ in range(layers)
-        ])
-        self.ln = nn.LayerNorm(dim)
-
-    def forward(self, x, mask=None):
-        for block in self.blocks:
-            x = block(x, src_mask=mask)
-        return self.ln(x)
-
 class UniGCRModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: UniGCRConfig):
         super().__init__()
         self.config = config
         
-        # Item Embedding
+        if OfficialHSTU is None:
+            raise RuntimeError("generative-recommenders not installed. Cannot use official HSTU.")
+
+        # 1. Embeddings & Feature Tokenizer (保持不变)
         self.item_emb = nn.Embedding(config.num_items + 1, config.embed_dim, padding_idx=0)
-        
-        # --- 新增: 特征 Tokenization 层 ---
         self.feature_tokenizer = FeatureTokenizer(
             cat_vocab_sizes=config.cat_feature_vocab_sizes,
             num_feature_size=config.num_feature_size,
@@ -100,13 +92,19 @@ class UniGCRModel(nn.Module):
             dropout=config.dropout
         )
         
-        # Backbone
-        self.encoder = HSTU(config.embed_dim, config.hstu_heads, config.hstu_layers, config.dropout)
+        # 2. Backbone: 使用官方 HSTU
+        # 转换配置
+        hstu_config = config.to_hstu_config()
+        self.backbone = OfficialHSTU(
+            config=hstu_config,
+            # 官方库通常需要传入 embedding_module 来做 tie_weights，
+            # 但我们这里只用它做 Encoder，所以可以不传或者传 None
+            embedding_module=None 
+        )
         
-        # Heads
+        # 3. Heads (GR & CTR) (保持不变)
         self.gr_head = nn.Linear(config.embed_dim, config.num_items + 1)
         
-        # CTR Components
         self.cand_proj = nn.Sequential(
             nn.LayerNorm(config.embed_dim),
             nn.Linear(config.embed_dim, config.embed_dim)
@@ -119,38 +117,51 @@ class UniGCRModel(nn.Module):
         )
 
     def get_user_state(self, history, cat_feats, num_feats):
-        """
-        Prefix Sharing: [Feature_Tokens, Sequence_Tokens] -> HSTU
-        """
-        # 1. Item Sequence Embeddings
-        seq_emb = self.item_emb(history) # (B, Seq_Len, D)
+        # 1. Prepare Embeddings (Prefix Sharing)
+        seq_emb = self.item_emb(history) # (B, T, D)
+        prefix_emb = self.feature_tokenizer(cat_feats, num_feats) # (B, P, D)
         
-        # 2. Side Feature Embeddings (Prefix)
-        # (B, Num_Feats, D)
-        prefix_emb = self.feature_tokenizer(cat_feats, num_feats)
-        
-        # 3. Prefix Sharing Concatenation
         if prefix_emb is not None:
-            x = torch.cat([prefix_emb, seq_emb], dim=1) # (B, N_Feat + Seq_Len, D)
+            x = torch.cat([prefix_emb, seq_emb], dim=1)
         else:
             x = seq_emb
             
-        # 4. Causal Mask Construction
-        # 我们的 Prefix 特征之间通常是全连接可见的（双向），或者也遵循因果律（单向）
-        # 通常推荐系统中，Profile 特征对所有历史行为可见，历史行为对 Profile 可见。
-        # 最简单做法：全 Causual Mask。即 Feature1 看不到 Feature2，Feature2 看不到 Item1...
-        # 更好做法：Prefix 部分互相可见，Sequence 部分 Causal。
-        # 这里为了兼容 HSTU/GPT 的标准实现，我们采用标准的 Causal Mask。
-        sz = x.size(1)
-        mask = torch.triu(torch.ones(sz, sz) * float('-inf'), diagonal=1).to(x.device)
+        # 计算有效长度 (非 Padding 部分)
+        # 假设 Item ID = 0 是 Padding
+        # Prefix 部分视为全有效
+        prefix_len = prefix_emb.shape[1]
+        hist_valid_mask = (history != 0) # (B, T_hist)
+        hist_lens = hist_valid_mask.sum(dim=1) # (B,)
+        total_lens = prefix_len + hist_lens # (B,)
         
-        # 5. Encoder
-        out = self.encoder(x, mask)
+        # --- Packing (转为 Jagged) ---
+        # 这种方式能最大化官方 HSTU 的性能
+        valid_tokens_list = []
+        for i in range(x.size(0)):
+            # 截取有效部分
+            valid_len = total_lens[i]
+            # 注意 x 已经是 concat 过的，前面是 prefix，后面是 history
+            # 但 history 可能中间夹杂 padding (如果是 left padding)，或者右边 padding
+            # 这里假设是 Right Padding
+            valid_tokens_list.append(x[i, :valid_len, :])
+            
+        packed_x = torch.cat(valid_tokens_list, dim=0) # (Sum_Lens, D)
+        lengths = total_lens.to(torch.int64)
         
-        # 6. 取最后一个 Token 作为 User State u
-        return out[:, -1, :] 
+        # 调用官方
+        # 官方 HSTU 通常接受 (all_tokens, lengths)
+        out_packed = self.backbone(packed_x, lengths)
+        
+        # --- Unpacking (还原回 Batch 取最后一个) ---
+        # 我们只需要每条样本的最后一个 Token
+        # 计算每个样本在 packed 序列中的结束位置索引
+        offsets = torch.cumsum(lengths, dim=0)
+        end_indices = offsets - 1
+        
+        u = out_packed[end_indices] # (B, D)
+        
+        return u
 
-    # ... (predict_ctr 等方法保持不变，因为它们只依赖 u) ...
     def predict_ctr(self, u, targets, gr_logits, device):
         # (代码同上一版，无需修改，因为 u 已经包含了 side info 的信息)
         B = u.size(0)
