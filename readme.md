@@ -2,16 +2,19 @@
 
 
 ```Text
-UniGCR_Project/
-├── data/                   # 存放原始数据
-├── src/
-│   ├── __init__.py
-│   ├── config.py           # 配置类
-│   ├── data.py             # Dataset 和 DataLoader 逻辑
-│   ├── model.py            # Uni-GCR 模型架构
-│   ├── trainer.py          # 封装训练和评估流程
-│   └── utils.py            # 评价指标 NDCG/Hit 等
-└── run.py                  # 启动脚本
+UniGCR_Repo/
+├── ds_config.json          # DeepSpeed 配置文件
+├── requirements.txt        # 依赖列表 (含安装顺序说明)
+├── run.py                  # 启动入口
+└── src/
+    ├── __init__.py
+    ├── config.py           # 全局配置 (Dataclass)
+    ├── data.py             # UniversalDataset & DataLoader
+    ├── grid_utils.py       # Semantic ID 映射与反查工具
+    ├── model.py            # 模型核心 (InputLayer, HSTU, Heads)
+    ├── trainer.py          # 训练循环, EarlyStop, Eval
+    └── utils.py            # Metrics, Distributed Utils
+
 
 配置
 PyTorch 带CUDA
