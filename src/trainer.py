@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 import deepspeed
-from .utils import compute_gr_metrics, compute_ctr_metrics, is_main_process, gather_tensors
+import json
+import numpy as np
+from .utils import is_main_process
 
 class UniGCRTrainer:
     def __init__(self, config, args, model, train_loader, val_loader=None):
@@ -11,251 +13,307 @@ class UniGCRTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         
-        # Loss Functions
+        # --- Loss Definitions ---
+        # GR 任务: 预测下一个 Semantic Code (Cross Entropy)
         self.gr_criterion = nn.CrossEntropyLoss()
         
+        # CTR 任务: 联合 Loss
         if config.enable_ctr:
             self.bce_loss = nn.BCEWithLogitsLoss()
             self.ce_loss = nn.CrossEntropyLoss()
-
-        # --- DeepSpeed Configuration Logic (New!) ---
+            
+        # --- DeepSpeed Initialization ---
         ds_config = None
-        
-        # 1. 显式读取 ds_config.json
         if hasattr(args, 'deepspeed_config') and args.deepspeed_config:
-            with open(args.deepspeed_config, 'r') as f:
-                ds_config = json.load(f)
-            
-            # 2. (可选) 动态覆盖参数，确保 config.py 是唯一真理
-            # 比如：强制让 DeepSpeed 的 batch size 等于我们 DataLoader 的设置
-            # 注意：DeepSpeed 的 train_batch_size 指的是 Global Batch Size
-            # Global = Micro_Batch_Per_GPU * World_Size * Grad_Accumulation
-            
-            # 这里演示最简单的：如果你在 json 里写了 "auto"，我们可以不做处理，
-            # 或者在这里手动把 config.lr 塞进去
-            if 'optimizer' in ds_config and 'params' in ds_config['optimizer']:
-                if ds_config['optimizer']['params'].get('lr') == 'auto':
-                    ds_config['optimizer']['params']['lr'] = config.lr
-            
-            if is_main_process():
-                print(f"[DeepSpeed] Config loaded explicitly from {args.deepspeed_config}")
-        
-        # --- DeepSpeed Initialize ---
-        # 注意这里我们使用了 config=ds_config，而不是完全依赖 args
+            try:
+                with open(args.deepspeed_config, 'r') as f:
+                    ds_config = json.load(f)
+                if is_main_process():
+                    print(f"[Trainer] Loaded DeepSpeed config from {args.deepspeed_config}")
+            except Exception as e:
+                print(f"[Trainer] Error loading DS config: {e}")
+                
+        # 初始化 DeepSpeed Engine
         self.model_engine, self.optimizer, _, _ = deepspeed.initialize(
-            args=args,
-            model=model,
-            model_parameters=model.parameters(),
-            config=ds_config, # <--- 显式传入字典
+            args=args, 
+            model=model, 
+            model_parameters=model.parameters(), 
+            config=ds_config, 
             dist_init_required=True
         )
-        
+
     def calculate_ctr_loss(self, ctr_logits, ctr_labels):
+        """
+        计算 CTR 任务的混合 Loss (InfoNCE + BCE)
+        """
+        # 1. InfoNCE (Ranking): 找出正样本所在的 Index
         target_idx = torch.argmax(ctr_labels, dim=1)
         loss_info = self.ce_loss(ctr_logits / self.config.temp, target_idx)
+        
+        # 2. BCE (Calibration): 逐个判断是点击(1)还是未点击(0)
         loss_bce = self.bce_loss(ctr_logits, ctr_labels)
         
-        loss_ctr = (self.config.loss_alpha * loss_info) + \
-                   (self.config.loss_beta * loss_bce)
-        return loss_ctr, loss_info, loss_bce
+        # 加权求和
+        return (self.config.loss_alpha * loss_info) + (self.config.loss_beta * loss_bce)
 
     def train_epoch(self, epoch_idx):
+        """
+        完整的训练 Epoch 逻辑
+        """
         self.model_engine.train()
         
-        total_loss = 0
-        total_gr_loss = 0
-        total_ctr_loss = 0
-        
+        # 仅主进程显示进度条
         if is_main_process():
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch_idx}")
         else:
             pbar = self.train_loader
-
-        for batch in pbar:
-            device = self.model_engine.device
             
-            # --- Unpack Batch (Hybrid Input) ---
-            hist = batch['history'].to(device)
-            cat_feats = batch['cat_feats'].to(device)
-            num_feats = batch['num_feats'].to(device)
-            tgt = batch['target'].to(device)
+        # 累计 Loss 用于日志
+        total_loss = 0.0
+        gr_loss_sum = 0.0
+        ctr_loss_sum = 0.0
+        
+        # 获取 GridMapper (用于 Beam Search 时的 Masking)
+        # 注意: DataLoader 可能经过 DistributedSampler 封装，需要通过 dataset 访问
+        grid_mapper = self.train_loader.dataset.grid_mapper
+        if grid_mapper is None and self.config.use_semantic_seq:
+            raise ValueError("GridMapper is required for Semantic ID training but not found.")
+        
+        for batch in pbar:
+            # 1. 将 Batch 数据移动到 GPU
+            batch = {
+                k: v.to(self.model_engine.device) 
+                for k, v in batch.items() 
+                if isinstance(v, torch.Tensor)
+            }
             
             self.model_engine.zero_grad()
             
-            # 1. GR Task: 传入所有特征
-            u, gr_logits = self.model_engine(hist, cat_feats, num_feats)
-            loss_gr = self.gr_criterion(gr_logits, tgt)
-            loss = loss_gr
+            # 2. Forward Pass (Shared Backbone & GR Head)
+            # u: User State (B, D)
+            # gr_logits: (B, Vocab) - Next Token Prediction Logits
+            u, gr_logits = self.model_engine(batch)
             
-            # 2. CTR Task
+            loss = 0.0
+            
+            # --- Task A: Generative Retrieval (GR) ---
+            if self.config.use_semantic_seq:
+                # Target: Flattened Semantic Sequence
+                # shape: (B * Layers)
+                target_flat = batch['sem_target'].view(-1)
+                loss_gr = self.gr_criterion(gr_logits, target_flat)
+                
+                loss += loss_gr
+                gr_loss_sum += loss_gr.item()
+            
+            # --- Task B: CTR Prediction (Optional) ---
             loss_ctr_val = 0.0
             if self.config.enable_ctr:
-                if hasattr(self.model_engine, 'module'): real_model = self.model_engine.module
-                else: real_model = self.model_engine
+                # 获取原始模型 (DeepSpeed wrap 了 module)
+                real_model = self.model_engine.module if hasattr(self.model_engine, 'module') else self.model_engine
                 
-                # predict_ctr 内部逻辑不变
-                ctr_logits, ctr_labels = real_model.predict_ctr(u, tgt, gr_logits, device)
-                loss_ctr, _, _ = self.calculate_ctr_loss(ctr_logits, ctr_labels)
+                # 正样本: 用户实际点击的 Item 的 Semantic Codes
+                # shape: (B, Layers)
+                pos_codes = batch['ctr_pos_codes']
+                
+                # 调用 predict_ctr
+                # 注意: 内部包含 Beam Search 逻辑，需要传入 batch (获取 History) 和 mapper
+                ctr_logits, ctr_labels = real_model.predict_ctr(
+                    u, batch, pos_codes, self.model_engine.device, grid_mapper
+                )
+                
+                # 计算 Loss
+                loss_ctr = self.calculate_ctr_loss(ctr_logits, ctr_labels)
+                
                 loss += loss_ctr
                 loss_ctr_val = loss_ctr.item()
+                ctr_loss_sum += loss_ctr_val
 
+            # 3. Backward & Step (DeepSpeed)
             self.model_engine.backward(loss)
             self.model_engine.step()
-
             
             total_loss += loss.item()
-            total_gr_loss += loss_gr.item()
-            total_ctr_loss += loss_ctr_val
             
-            # 实时进度条显示
+            # 更新进度条
             if is_main_process():
                 logs = {
-                    'loss': f"{loss.item():.4f}", 
-                    'gr_loss': f"{loss_gr.item():.4f}"
+                    'Loss': f"{loss.item():.4f}", 
+                    'GR': f"{loss_gr.item() if self.config.use_semantic_seq else 0:.4f}"
                 }
                 if self.config.enable_ctr:
-                    logs['ctr_loss'] = f"{loss_ctr_val:.4f}"
+                    logs['CTR'] = f"{loss_ctr_val:.4f}"
                 pbar.set_postfix(logs)
             
-        # 返回平均 Loss
-        n = len(self.train_loader)
+        # 计算平均 Loss
+        num_batches = len(self.train_loader)
         return {
-            'loss': total_loss / n,
-            'gr_loss': total_gr_loss / n,
-            'ctr_loss': total_ctr_loss / n
+            'loss': total_loss / num_batches,
+            'gr_loss': gr_loss_sum / num_batches,
+            'ctr_loss': ctr_loss_sum / num_batches
         }
 
     @torch.no_grad()
     def evaluate(self, topk=10):
-        if not self.val_loader: return {}
+        """
+        完整的评估逻辑：Beam Search 生成 -> Item 还原 -> 指标计算
+        """
+        if not self.val_loader:
+            return {}
         
         self.model_engine.eval()
         device = self.model_engine.device
         
-        all_gr_preds = []
-        all_gr_targets = []
-        all_ctr_logits = []
-        all_ctr_labels = []
+        all_hits = []
+        all_ndcgs = []
         
-        iterator = tqdm(self.val_loader, desc="Eval") if is_main_process() else self.val_loader
-        
-        for batch in iterator:
-            hist = batch['history'].to(device)
-            cat_feats = batch['cat_feats'].to(device)
-            num_feats = batch['num_feats'].to(device)
-            tgt = batch['target'].to(device)
-            
-            # Inference 也要传入特征
-            u, gr_logits = self.model_engine(hist, cat_feats, num_feats)
-            
-            # --- GR Eval (Always) ---
-            _, top_indices = torch.topk(gr_logits, topk, dim=1)
-            all_gr_preds.append(top_indices)
-            all_gr_targets.append(tgt)
-            
-            # --- CTR Eval (Conditional) ---
-            if self.config.enable_ctr:
-                if hasattr(self.model_engine, 'module'):
-                    real_model = self.model_engine.module
-                else:
-                    real_model = self.model_engine
-                
-                ctr_logits, ctr_labels = real_model.predict_ctr(u, tgt, gr_logits, device)
-                all_ctr_logits.append(ctr_logits.view(-1))
-                all_ctr_labels.append(ctr_labels.view(-1))
+        # 必须获取 Mapper 进行 ID 还原
+        dataset = self.val_loader.dataset
+        grid_mapper = dataset.grid_mapper
+        if not grid_mapper:
+            print("[Eval] Warning: GridMapper missing, skipping evaluation.")
+            return {}
 
-        # Gather results from all GPUs
-        global_gr_preds = gather_tensors(torch.cat(all_gr_preds, dim=0))
-        global_gr_targets = gather_tensors(torch.cat(all_gr_targets, dim=0))
+        if is_main_process():
+            iterator = tqdm(self.val_loader, desc="Evaluating")
+        else:
+            iterator = self.val_loader
         
-        results = {}
-        
-        # 1. GR Metrics (Always Calculate)
-        hit, ndcg = compute_gr_metrics(global_gr_preds, global_gr_targets, k=topk)
-        results['Hit@10'] = hit
-        results['NDCG@10'] = ndcg
-        
-        # 2. CTR Metrics (Conditional)
-        if self.config.enable_ctr and len(all_ctr_logits) > 0:
-            global_ctr_logits = gather_tensors(torch.cat(all_ctr_logits, dim=0))
-            global_ctr_labels = gather_tensors(torch.cat(all_ctr_labels, dim=0))
+        # 获取原始模型 (用于调用 generate 方法)
+        real_model = self.model_engine.module if hasattr(self.model_engine, 'module') else self.model_engine
+
+        for batch in iterator:
+            # 移到 GPU
+            batch = {
+                k: v.to(device) 
+                for k, v in batch.items() 
+                if isinstance(v, torch.Tensor)
+            }
             
-            auc, logloss = compute_ctr_metrics(global_ctr_logits, global_ctr_labels)
-            results['AUC'] = auc
-            results['LogLoss'] = logloss
+            # GT Item Codes: (B, Layers) - 评估用的 Target
+            tgt_codes = batch['sem_target_eval']
             
-        return results
+            # --- 1. 生成候选 (Beam Search) ---
+            # 返回: (B, K, Layers)
+            # 注意: 这里使用 Beam Search 确保生成的 Semantic ID 是合法的
+            candidates = real_model.generate_gr_candidates(
+                batch, k=topk, grid_mapper=grid_mapper
+            )
+            
+            # --- 2. 还原 Item ID 并计算指标 ---
+            # 转 CPU 进行查表操作
+            cand_cpu = candidates.cpu().numpy()
+            tgt_cpu = tgt_codes.cpu().numpy()
+            
+            B = cand_cpu.shape[0]
+            
+            for i in range(B):
+                # 还原真实 Item ID
+                true_item_id = grid_mapper.codes_to_item(tgt_cpu[i])
+                
+                # 如果 Target 对应的 Code 组合在映射表中不存在 (数据问题)，跳过
+                if true_item_id is None:
+                    continue 
+                
+                # 还原预测的 Top-K Item IDs
+                pred_item_ids = []
+                for k_idx in range(topk):
+                    code_tuple = cand_cpu[i, k_idx]
+                    pid = grid_mapper.codes_to_item(code_tuple)
+                    # 如果生成的 Code 组合无效 (pid is None)，视为未命中
+                    pred_item_ids.append(pid)
+                
+                # 计算 Hit & NDCG
+                hit = 0.0
+                ndcg = 0.0
+                
+                if true_item_id in pred_item_ids:
+                    hit = 1.0
+                    rank = pred_item_ids.index(true_item_id)
+                    ndcg = 1.0 / np.log2(rank + 2.0)
+                
+                all_hits.append(hit)
+                all_ndcgs.append(ndcg)
+        
+        # --- 3. 分布式指标聚合 (All Reduce) ---
+        # 计算当前 GPU 的平均值
+        local_hit_sum = np.sum(all_hits)
+        local_ndcg_sum = np.sum(all_ndcgs)
+        local_count = len(all_hits)
+        
+        # 转 Tensor 方便通信
+        stats_tensor = torch.tensor([local_hit_sum, local_ndcg_sum, local_count], dtype=torch.float32, device=device)
+        
+        # 全局求和
+        torch.distributed.all_reduce(stats_tensor, op=torch.distributed.ReduceOp.SUM)
+        
+        global_hit_sum = stats_tensor[0].item()
+        global_ndcg_sum = stats_tensor[1].item()
+        global_count = stats_tensor[2].item()
+        
+        final_hit = global_hit_sum / global_count if global_count > 0 else 0.0
+        final_ndcg = global_ndcg_sum / global_count if global_count > 0 else 0.0
+        
+        return {'Hit@10': final_hit, 'NDCG@10': final_ndcg}
 
     def save(self, tag):
+        """保存 Checkpoint"""
         self.model_engine.save_checkpoint(save_dir="checkpoints", tag=tag)
 
     def train(self):
-        # --- 策略配置 ---
+        """
+        主训练流程控制: Early Stopping + Logging
+        """
+        # 确定监控指标
         if self.config.enable_ctr:
-            monitor_metric = 'LogLoss'
-            mode = 'min'  # LogLoss 越小越好
-            best_metric = float('inf')
+            # 如果开启 CTR，我们通常更关注 GR 的召回能力是否因为联合训练提升了，
+            # 或者关注 CTR 的 LogLoss。这里以 HitRate 为准，因为最终目标是推荐。
+            monitor_metric = 'Hit@10' 
+            mode = 'max'
         else:
             monitor_metric = 'Hit@10'
-            mode = 'max'  # HitRate 越大越好
-            best_metric = 0.0
+            mode = 'max'
             
+        best_metric = 0.0 if mode == 'max' else float('inf')
         patience_counter = 0
         
         if is_main_process():
             print(f"Start Training... Monitor: {monitor_metric} (Best is {mode})")
+            print(f"DeepSpeed Config Enabled: {self.args.deepspeed_config is not None}")
 
         for epoch in range(1, self.config.epochs + 1):
+            # 必须设置 DistributedSampler 的 epoch 以保证 shuffle
             if hasattr(self.train_loader.sampler, 'set_epoch'):
                 self.train_loader.sampler.set_epoch(epoch)
             
-            # Training
+            # 1. Train
             train_metrics = self.train_epoch(epoch)
             
-            # Evaluation
-            eval_metrics = self.evaluate()
+            # 2. Eval
+            eval_metrics = self.evaluate(topk=10)
             
-            # --- 日志输出 ---
+            # 3. Logging
             if is_main_process():
-                # 基础日志 (GR部分)
                 log_str = f"Epoch {epoch} | "
-                log_str += f"Train Loss: {train_metrics['loss']:.4f} (GR: {train_metrics['gr_loss']:.4f}"
-                
-                # CTR Loss日志
-                if self.config.enable_ctr:
-                    log_str += f", CTR: {train_metrics['ctr_loss']:.4f})"
-                else:
-                    log_str += ")"
-                
-                log_str += " | Eval: "
-                
-                # GR Metrics (必显)
-                log_str += f"Hit@10: {eval_metrics.get('Hit@10', 0):.4f} NDCG@10: {eval_metrics.get('NDCG@10', 0):.4f} "
-                
-                # CTR Metrics (选显)
-                if self.config.enable_ctr:
-                    log_str += f"AUC: {eval_metrics.get('AUC', 0):.4f} LogLoss: {eval_metrics.get('LogLoss', 0):.4f}"
-                
+                log_str += f"Loss: {train_metrics['loss']:.4f} "
+                log_str += f"(GR: {train_metrics['gr_loss']:.4f}, CTR: {train_metrics['ctr_loss']:.4f}) | "
+                log_str += f"Eval: Hit@10: {eval_metrics.get('Hit@10', 0):.4f} NDCG@10: {eval_metrics.get('NDCG@10', 0):.4f}"
                 print(log_str)
             
-            # --- Early Stopping & Best Model Logic ---
-            current_val = eval_metrics.get(monitor_metric)
-            if current_val is None:
-                continue # Should not happen
-
+            # 4. Early Stopping Logic
+            current_val = eval_metrics.get(monitor_metric, 0.0)
+            
             improved = False
-            if mode == 'min':
-                if current_val < best_metric:
-                    improved = True
-            else: # mode == 'max'
-                if current_val > best_metric:
-                    improved = True
+            if mode == 'max':
+                if current_val > best_metric: improved = True
+            else:
+                if current_val < best_metric: improved = True
             
             if improved:
                 best_metric = current_val
                 patience_counter = 0
                 if is_main_process():
-                    print(f" >> New Best {monitor_metric}: {best_metric:.4f}. Saving Model...")
+                    print(f" >> New Best {monitor_metric}! Saving Model...")
                 self.save("best_model")
             else:
                 patience_counter += 1
