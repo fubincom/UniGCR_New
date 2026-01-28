@@ -158,131 +158,141 @@ class UniGCRTrainer:
         """
         完整的评估逻辑：Beam Search 生成 -> Item 还原 -> 指标计算
         """
-        if not self.val_loader:
-            return {}
+        """
+        评估逻辑：
+        1. 计算 Validation Loss (GR & CTR) -> 用于 Early Stop
+        2. 计算 Metrics (Hit/NDCG/AUC/LogLoss) -> 用于展示效果
+        """
+        if not self.val_loader: return {}
         
         self.model_engine.eval()
         device = self.model_engine.device
+        grid_mapper = self.val_loader.dataset.grid_mapper
         
-        all_hits = []
-        all_ndcgs = []
+        # 统计变量 (用于 Loss 计算)
+        val_gr_loss_sum = 0.0
+        val_ctr_loss_sum = 0.0
         
-        # 必须获取 Mapper 进行 ID 还原
-        dataset = self.val_loader.dataset
-        grid_mapper = dataset.grid_mapper
-        if not grid_mapper:
-            print("[Eval] Warning: GridMapper missing, skipping evaluation.")
-            return {}
+        # 统计变量 (用于 Metrics 计算)
+        # GR
+        all_hit_sums = 0.0
+        all_ndcg_sums = 0.0
+        all_gr_count = 0
+        
+        # CTR (收集 Logits 和 Labels 计算全局 AUC)
+        all_ctr_logits = []
+        all_ctr_labels = []
 
-        if is_main_process():
-            iterator = tqdm(self.val_loader, desc="Evaluating")
-        else:
-            iterator = self.val_loader
-        
-        # 获取原始模型 (用于调用 generate 方法)
+        iterator = tqdm(self.val_loader, desc="Eval") if is_main_process() else self.val_loader
         real_model = self.model_engine.module if hasattr(self.model_engine, 'module') else self.model_engine
 
         for batch in iterator:
-            # 移到 GPU
-            batch = {
-                k: v.to(device) 
-                for k, v in batch.items() 
-                if isinstance(v, torch.Tensor)
-            }
+            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
             
-            # GT Item Codes: (B, Layers) - 评估用的 Target
-            tgt_codes = batch['sem_target_eval']
+            # --- A. 计算 Validation Loss ---
+            # 1. Forward
+            u, gr_logits = self.model_engine(batch)
             
-            # --- 1. 生成候选 (Beam Search) ---
-            # 返回: (B, K, Layers)
-            # 注意: 这里使用 Beam Search 确保生成的 Semantic ID 是合法的
+            # 2. GR Val Loss
+            if self.config.use_semantic_seq:
+                loss_gr = self.gr_criterion(gr_logits, batch['sem_target'].view(-1))
+                val_gr_loss_sum += loss_gr.item()
+                
+            # 3. CTR Val Loss & Logits Collection
+            if self.config.enable_ctr:
+                # 在 Eval 阶段，predict_ctr 内部依然会做 Beam Search 生成负样本
+                # 这保证了 Loss 的计算方式与训练一致
+                ctr_logits, ctr_labels = real_model.predict_ctr(
+                    u, batch, batch['ctr_pos_codes'], device, grid_mapper
+                )
+                
+                loss_ctr, _, _ = self.calculate_ctr_loss(ctr_logits, ctr_labels)
+                val_ctr_loss_sum += loss_ctr.item()
+                
+                # 收集用于计算 AUC/LogLoss 指标
+                all_ctr_logits.append(ctr_logits.view(-1))
+                all_ctr_labels.append(ctr_labels.view(-1))
+
+            # --- B. 计算 GR Ranking Metrics (Hit/NDCG) ---
+            # 这部分需要 Beam Search 生成，比较耗时
+            # 如果只为了 Early Stop (Loss based)，可以跳过这步，但为了监控指标还是加上
             candidates = real_model.generate_gr_candidates(
                 batch, k=topk, grid_mapper=grid_mapper
             )
             
-            # --- 2. 还原 Item ID 并计算指标 ---
-            # 转 CPU 进行查表操作
-            cand_cpu = candidates.cpu().numpy()
-            tgt_cpu = tgt_codes.cpu().numpy()
+            # 计算当前 batch 的平均 Hit/NDCG
+            # 注意: target_eval 是原始 Item Codes，不是 flattened
+            batch_hit, batch_ndcg = compute_gr_metrics(
+                candidates, batch['sem_target_eval'], grid_mapper, k=topk
+            )
             
-            B = cand_cpu.shape[0]
+            all_hit_sums += batch_hit * batch['sem_target_eval'].size(0)
+            all_ndcg_sums += batch_ndcg * batch['sem_target_eval'].size(0)
+            all_gr_count += batch['sem_target_eval'].size(0)
+
+        # --- 汇总结果 ---
+        num_batches = len(self.val_loader)
+        
+        # 1. Loss 汇总 (Mean across batches)
+        # 简单平均即可，不需要 gather (因为 DP 每个卡数据量差不多)
+        avg_gr_loss = val_gr_loss_sum / num_batches
+        avg_ctr_loss = val_ctr_loss_sum / num_batches
+        
+        # 2. GR Metrics 汇总 (AllReduce)
+        # 转 Tensor
+        gr_stats = torch.tensor([all_hit_sums, all_ndcg_sums, all_gr_count], device=device)
+        torch.distributed.all_reduce(gr_stats, op=torch.distributed.ReduceOp.SUM)
+        
+        final_hit = gr_stats[0] / gr_stats[2] if gr_stats[2] > 0 else 0.0
+        final_ndcg = gr_stats[1] / gr_stats[2] if gr_stats[2] > 0 else 0.0
+        
+        results = {
+            'val_gr_loss': avg_gr_loss,
+            'Hit@10': final_hit.item(),
+            'NDCG@10': final_ndcg.item()
+        }
+        
+        # 3. CTR Metrics 汇总 (Gather & Sklearn)
+        if self.config.enable_ctr and len(all_ctr_logits) > 0:
+            local_logits = torch.cat(all_ctr_logits)
+            local_labels = torch.cat(all_ctr_labels)
             
-            for i in range(B):
-                # 还原真实 Item ID
-                true_item_id = grid_mapper.codes_to_item(tgt_cpu[i])
-                
-                # 如果 Target 对应的 Code 组合在映射表中不存在 (数据问题)，跳过
-                if true_item_id is None:
-                    continue 
-                
-                # 还原预测的 Top-K Item IDs
-                pred_item_ids = []
-                for k_idx in range(topk):
-                    code_tuple = cand_cpu[i, k_idx]
-                    pid = grid_mapper.codes_to_item(code_tuple)
-                    # 如果生成的 Code 组合无效 (pid is None)，视为未命中
-                    pred_item_ids.append(pid)
-                
-                # 计算 Hit & NDCG
-                hit = 0.0
-                ndcg = 0.0
-                
-                if true_item_id in pred_item_ids:
-                    hit = 1.0
-                    rank = pred_item_ids.index(true_item_id)
-                    ndcg = 1.0 / np.log2(rank + 2.0)
-                
-                all_hits.append(hit)
-                all_ndcgs.append(ndcg)
+            # Gather 全局数据算 AUC 才准确
+            global_logits = gather_tensors(local_logits)
+            global_labels = gather_tensors(local_labels)
+            
+            results['val_ctr_loss'] = avg_ctr_loss
+            
+            if is_main_process():
+                auc, logloss = compute_ctr_metrics(global_logits, global_labels)
+                results['AUC'] = auc
+                results['LogLoss'] = logloss
         
-        # --- 3. 分布式指标聚合 (All Reduce) ---
-        # 计算当前 GPU 的平均值
-        local_hit_sum = np.sum(all_hits)
-        local_ndcg_sum = np.sum(all_ndcgs)
-        local_count = len(all_hits)
-        
-        # 转 Tensor 方便通信
-        stats_tensor = torch.tensor([local_hit_sum, local_ndcg_sum, local_count], dtype=torch.float32, device=device)
-        
-        # 全局求和
-        torch.distributed.all_reduce(stats_tensor, op=torch.distributed.ReduceOp.SUM)
-        
-        global_hit_sum = stats_tensor[0].item()
-        global_ndcg_sum = stats_tensor[1].item()
-        global_count = stats_tensor[2].item()
-        
-        final_hit = global_hit_sum / global_count if global_count > 0 else 0.0
-        final_ndcg = global_ndcg_sum / global_count if global_count > 0 else 0.0
-        
-        return {'Hit@10': final_hit, 'NDCG@10': final_ndcg}
+        return results
 
     def save(self, tag):
         """保存 Checkpoint"""
         self.model_engine.save_checkpoint(save_dir="checkpoints", tag=tag)
 
     def train(self):
-        """
-        主训练流程控制: Early Stopping + Logging
-        """
-        # 确定监控指标
+        # Early Stopping 策略设置
+        # 如果开启 CTR: 监控 CTR LogLoss (min)
+        # 如果仅 GR: 监控 GR Loss (min)
         if self.config.enable_ctr:
-            # 如果开启 CTR，我们通常更关注 GR 的召回能力是否因为联合训练提升了，
-            # 或者关注 CTR 的 LogLoss。这里以 HitRate 为准，因为最终目标是推荐。
-            monitor_metric = 'Hit@10' 
-            mode = 'max'
+            monitor_metric = 'LogLoss' # 实际对应 val_ctr_loss 或 metrics 里的 LogLoss
+            mode = 'min'
+            best_val = float('inf')
         else:
-            monitor_metric = 'Hit@10'
-            mode = 'max'
+            monitor_metric = 'val_gr_loss'
+            mode = 'min'
+            best_val = float('inf')
             
-        best_metric = 0.0 if mode == 'max' else float('inf')
         patience_counter = 0
         
         if is_main_process():
-            print(f"Start Training... Monitor: {monitor_metric} (Best is {mode})")
-            print(f"DeepSpeed Config Enabled: {self.args.deepspeed_config is not None}")
+            print(f"Start Training. Monitor: {monitor_metric} (Best: {mode})")
 
         for epoch in range(1, self.config.epochs + 1):
-            # 必须设置 DistributedSampler 的 epoch 以保证 shuffle
             if hasattr(self.train_loader.sampler, 'set_epoch'):
                 self.train_loader.sampler.set_epoch(epoch)
             
@@ -292,35 +302,45 @@ class UniGCRTrainer:
             # 2. Eval
             eval_metrics = self.evaluate(topk=10)
             
-            # 3. Logging
+            # 3. Logging & Early Stop Logic
             if is_main_process():
-                log_str = f"Epoch {epoch} | "
-                log_str += f"Loss: {train_metrics['loss']:.4f} "
-                log_str += f"(GR: {train_metrics['gr_loss']:.4f}, CTR: {train_metrics['ctr_loss']:.4f}) | "
-                log_str += f"Eval: Hit@10: {eval_metrics.get('Hit@10', 0):.4f} NDCG@10: {eval_metrics.get('NDCG@10', 0):.4f}"
+                # 打印日志
+                log_str = f"Ep {epoch} | "
+                log_str += f"Tr_Loss: GR={train_metrics['gr_loss']:.4f} "
+                if self.config.enable_ctr:
+                    log_str += f"CTR={train_metrics['ctr_loss']:.4f} | "
+                else:
+                    log_str += "| "
+                
+                log_str += f"Eval: "
+                log_str += f"Hit@10={eval_metrics['Hit@10']:.4f} NDCG@10={eval_metrics['NDCG@10']:.4f} GR_Loss={eval_metrics['val_gr_loss']:.4f} "
+                
+                if self.config.enable_ctr:
+                    log_str += f"AUC={eval_metrics.get('AUC',0):.4f} LogLoss={eval_metrics.get('LogLoss',0):.4f}"
+                
                 print(log_str)
-            
-            # 4. Early Stopping Logic
-            current_val = eval_metrics.get(monitor_metric, 0.0)
-            
-            improved = False
-            if mode == 'max':
-                if current_val > best_metric: improved = True
-            else:
-                if current_val < best_metric: improved = True
-            
-            if improved:
-                best_metric = current_val
-                patience_counter = 0
-                if is_main_process():
-                    print(f" >> New Best {monitor_metric}! Saving Model...")
-                self.save("best_model")
-            else:
-                patience_counter += 1
-                if is_main_process():
-                    print(f" >> No improvement. Patience: {patience_counter}/{self.config.patience}")
-            
+                
+                # 获取当前监控指标
+                current_val = eval_metrics.get(monitor_metric, float('inf'))
+                
+                # 判断更优
+                improved = False
+                if mode == 'min':
+                    if current_val < best_val: improved = True
+                else:
+                    if current_val > best_val: improved = True
+                
+                if improved:
+                    best_val = current_val
+                    patience_counter = 0
+                    print(f" >> New Best {monitor_metric}! Saving...")
+                    self.save("best_model")
+                else:
+                    patience_counter += 1
+                    print(f" >> No improve. Patience {patience_counter}/{self.config.patience}")
+                
+            # 同步 Early Stop 状态 (可选，这里依赖主进程 break 也可以，或者广播)
+            # 简单起见，如果达到耐心值，主进程抛出异常或结束，这里我们不做多进程同步退出
             if patience_counter >= self.config.patience:
-                if is_main_process():
-                    print(" >> Early Stopping Triggered.")
+                if is_main_process(): print("Early Stopping.")
                 break
